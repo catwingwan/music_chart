@@ -1,0 +1,224 @@
+# music_chart_mvp.py
+# MVP: 自動建立歌曲排行榜，生成 HTML，並自動發佈到 Blogger（含 AI 解說段落）
+
+import requests
+import pandas as pd
+import urllib.parse
+from dotenv import load_dotenv
+import os
+import json
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from io import StringIO
+from datetime import datetime, timedelta
+
+# === 載入環境變數 ===
+load_dotenv()
+
+# === CONFIG ===
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID") or "YOUR_SPOTIFY_CLIENT_ID"
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET") or "YOUR_SPOTIFY_CLIENT_SECRET"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY") or "YOUR_YOUTUBE_API_KEY"
+BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET") or "client_secret.json"
+BLOG_ID = os.getenv("BLOG_ID") or "YOUR_BLOG_ID"
+TOKEN_PATH = "token.json"
+
+# 地區顯示名稱對應
+REGION_NAMES = {
+    "my": "馬來西亞",
+    "sg": "新加坡",
+    "ph": "菲律賓",
+    "id": "印尼"
+}
+
+# === 初始化 log 資料夾 ===
+os.makedirs("logs", exist_ok=True)
+os.makedirs("logs/raw", exist_ok=True)
+
+# === Spotify 授權 ===
+def get_spotify_token():
+    resp = requests.post("https://accounts.spotify.com/api/token",
+        data={"grant_type": "client_credentials"},
+        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET))
+    if resp.status_code != 200:
+        print(f"⚠ 無法取得 Spotify token：{resp.status_code} - {resp.text}")
+        return None
+    token = resp.json().get("access_token")
+    print(f"🎫 成功取得 Spotify token: {token[:10]}...")
+    return token
+
+# === 播放清單搜尋 API ===
+def search_playlist(query, token):
+    url = f"https://api.spotify.com/v1/search?q={urllib.parse.quote(query)}&type=playlist&limit=1"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        print(f"⚠ 搜尋播放清單失敗：{resp.status_code} - {resp.text}")
+        return None
+    items = resp.json().get("playlists", {}).get("items", [])
+    if not items:
+        print(f"⚠ 找不到播放清單：{query}")
+        return None
+    return items[0]["id"]
+
+# === Spotify Top 50（播放清單 API） ===
+def fetch_spotify_top_playlist(region="my", limit=10):
+    token = get_spotify_token()
+    if not token:
+        print("❌ Spotify token 為空，終止獲取播放清單")
+        return []
+
+    query_name = f"Top 50 - {region.upper()}"
+    playlist_id = search_playlist(query_name, token)
+    if not playlist_id:
+        print(f"🔁 嘗試 fallback 至 Top 50 - Global")
+        playlist_id = search_playlist("Top 50 - Global", token)
+    if not playlist_id:
+        print("❌ 找不到有效播放清單 ID")
+        return []
+
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit={limit}&fields=items(track(name,artists(name)))"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers)
+    print(f"📡 呼叫 Spotify 播放清單 API：{resp.status_code}")
+
+    if resp.status_code != 200:
+        print(f"⚠ 無法下載播放清單（{region}）: HTTP {resp.status_code}")
+        print(f"⚠ 錯誤內容：{resp.text[:300]}")
+        return []
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        print(f"⚠ JSON 解碼失敗：{e}")
+        print(resp.text[:500])
+        return []
+
+    debug_file = f"logs/raw/spotify_raw_{region}.json"
+    with open(debug_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"📝 原始 JSON 已儲存：{debug_file}")
+
+    items = data.get("items", [])
+    print(f"🔎 播放清單取得成功：{len(items)} 首")
+
+    songs = []
+    for item in items:
+        track = item.get("track")
+        if track is None:
+            continue
+        name = track.get("name", "")
+        artists = ", ".join([artist.get("name", "") for artist in track.get("artists", [])])
+        if name and artists:
+            songs.append({"歌曲名稱": name, "歌手": artists})
+
+    return songs
+
+# === 查 Spotify 熱度 ===
+def fetch_spotify_popularity(song, artist, token):
+    query = urllib.parse.quote(f"track:{song} artist:{artist}")
+    url = f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers)
+    items = resp.json().get("tracks", {}).get("items", [])
+    if items:
+        return items[0].get("popularity", 0)
+    return 0
+
+# === 查 YouTube 播放量 ===
+def fetch_youtube_views(song, artist):
+    query = urllib.parse.quote(f"{song} {artist}")
+    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={query}&key={YOUTUBE_API_KEY}&maxResults=1&type=video"
+    resp = requests.get(search_url).json()
+    items = resp.get("items", [])
+    if not items:
+        return 0
+    video_id = items[0].get("id", {}).get("videoId")
+    if not video_id:
+        return 0
+    stat_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics&id={video_id}&key={YOUTUBE_API_KEY}"
+    stats = requests.get(stat_url).json()
+    if "items" not in stats or not stats["items"]:
+        return 0
+    views = stats["items"][0]["statistics"].get("viewCount", 0)
+    return int(views)
+
+# === 整合資料與排序 ===
+def build_chart(source="top50", region="my"):
+    token = get_spotify_token()
+    if not token:
+        return pd.DataFrame()
+    songs = fetch_spotify_top_playlist(region=region, limit=10)
+    if not songs:
+        return pd.DataFrame()
+
+    chart = []
+    for song in songs:
+        yt_views = fetch_youtube_views(song['歌曲名稱'], song['歌手'])
+        spotify_pop = fetch_spotify_popularity(song['歌曲名稱'], song['歌手'], token)
+        score = (yt_views / 1000) * 0.5 + spotify_pop * 0.5
+        chart.append({
+            "歌曲": song['歌曲名稱'],
+            "歌手": song['歌手'],
+            "YT播放量": yt_views,
+            "Spotify熱度": spotify_pop,
+            "總分": round(score, 2),
+            "Spotify連結": f"https://open.spotify.com/search/{urllib.parse.quote(song['歌曲名稱'] + ' ' + song['歌手'])}"
+        })
+
+    df = pd.DataFrame(chart)
+    df["排名"] = df["總分"].rank(ascending=False, method="min").astype(int)
+    return df.sort_values("排名")
+
+# === 產生 HTML 表格 ===
+def generate_html_table(df):
+    html = '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; font-family:sans-serif;">'
+    html += '<thead><tr style="background-color:#f2f2f2;"><th>排名</th><th>歌曲</th><th>歌手</th><th>YT 播放</th><th>Spotify 熱度</th><th>總分</th><th>Spotify</th></tr></thead><tbody>'
+    for _, row in df.iterrows():
+        html += f"<tr><td>{row['排名']}</td><td>{row['歌曲']}</td><td>{row['歌手']}</td><td>{row['YT播放量']}</td><td>{row['Spotify熱度']}</td><td>{row['總分']}</td><td><a href='{row['Spotify連結']}' target='_blank'>🎵</a></td></tr>"
+    html += '</tbody></table>'
+    return html
+
+# === 發佈至 Blogger（修正結構） ===
+def publish_to_blogger(content_html, region):
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, ['https://www.googleapis.com/auth/blogger'])
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(BLOGGER_CLIENT_SECRET, scopes=['https://www.googleapis.com/auth/blogger'])
+        creds = flow.run_local_server(port=8080)
+        with open(TOKEN_PATH, 'w') as token:
+            token.write(creds.to_json())
+
+    service = build('blogger', 'v3', credentials=creds)
+    region_name = REGION_NAMES.get(region, region.upper())
+    title = f"每週歌曲數據榜（{region_name}）"
+
+    body = {
+        "title": title,
+        "content": content_html
+    }
+
+    post = service.posts().insert(blogId=BLOG_ID, body=body, isDraft=False).execute()
+    print(f"✅ 已發佈：{post['title']}")
+
+# === AI 解說生成（簡化） ===
+def generate_ai_summary(df):
+    top3 = df.head(3)
+    summary = "\n".join([f"《{row['歌曲']}》 by {row['歌手']}" for _, row in top3.iterrows()])
+    return f"本週前 3 名歌曲為：{summary}，趨勢仍以華語流行為主！"
+
+# === 主程式 ===
+if __name__ == "__main__":
+    regions = ["my", "sg", "ph", "id"]
+    for region in regions:
+        print(f"🔄 產生 {region.upper()} 排行榜...")
+        df = build_chart(region=region)
+        if df.empty:
+            print("⚠ 無法建立排行榜，來源資料為空或失敗。")
+            continue
+        html_table = generate_html_table(df)
+        summary = generate_ai_summary(df)
+        full_content = f"<p>{summary}</p>{html_table}"
+        publish_to_blogger(full_content, region)

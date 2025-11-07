@@ -1,0 +1,190 @@
+# music_chart_mvp.py
+# MVP: 自動建立歌曲排行榜，生成 HTML，並自動發佈到 Blogger（含 AI 解說段落）
+
+import requests
+import pandas as pd
+import urllib.parse
+from dotenv import load_dotenv
+import os
+import json
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# === 載入環境變數 ===
+load_dotenv()
+
+# === CONFIG ===
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID") or "YOUR_SPOTIFY_CLIENT_ID"
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET") or "YOUR_SPOTIFY_CLIENT_SECRET"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY") or "YOUR_YOUTUBE_API_KEY"
+TOKEN_PATH = "token.json"
+
+# === 動態取得 Spotify 新歌榜單 ===
+def fetch_spotify_new_releases(token, limit=10):
+    url = f"https://api.spotify.com/v1/browse/new-releases?limit={limit}"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers)
+    albums = resp.json().get("albums", {}).get("items", [])
+    songs = []
+    for album in albums:
+        name = album['name']
+        artists = ", ".join([artist['name'] for artist in album['artists']])
+        songs.append({"歌曲名稱": name, "歌手": artists})
+    return songs
+
+# === Spotify 授權 ===
+def get_spotify_token():
+    resp = requests.post("https://accounts.spotify.com/api/token",
+        data={"grant_type": "client_credentials"},
+        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET))
+    return resp.json().get("access_token")
+
+# === 查 Spotify 熱度 ===
+def fetch_spotify_popularity(song, artist, token):
+    from datetime import datetime
+    week_str = datetime.now().strftime("%Y-%W")
+    log_path = f"logs/error_log_{week_str}.txt"
+    with open(log_path, "a", encoding="utf-8") as log:
+        query = urllib.parse.quote(f"track:{song} artist:{artist}")
+        url = f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1"
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(url, headers=headers)
+        items = resp.json().get("tracks", {}).get("items", [])
+        if items:
+            return items[0]["popularity"]
+        print(f"⚠ 找不到 Spotify 熱度：{song} - {artist}")
+        log.write(f"No Spotify popularity found for: {song} - {artist}\\n")
+        return 0
+
+# === 查 YouTube 播放量 ===
+def fetch_youtube_views(song, artist):
+    from datetime import datetime
+    week_str = datetime.now().strftime("%Y-%W")
+    log_path = f"logs/error_log_{week_str}.txt"
+    with open(log_path, "a", encoding="utf-8") as log:
+        query = urllib.parse.quote(f"{song} {artist}")
+        search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={query}&key={YOUTUBE_API_KEY}&maxResults=1&type=video"
+        resp = requests.get(search_url).json()
+        items = resp.get("items", [])
+        if not items:
+            print(f"⚠ 找不到影片：{song} - {artist}")
+            log.write(f"No video found for: {song} - {artist}\\n")
+            return 0
+        video_id = items[0].get("id", {}).get("videoId")
+        if not video_id:
+            return 0
+        stat_url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics&id={video_id}&key={YOUTUBE_API_KEY}"
+        stats = requests.get(stat_url).json()
+        if "items" not in stats or not stats["items"]:
+            return 0
+        views = stats["items"][0]["statistics"].get("viewCount", 0)
+        return int(views)
+
+# === 整合資料與排序 ===
+def build_chart():
+    token = get_spotify_token()
+    songs = fetch_spotify_new_releases(token, limit=10)
+    chart = []
+    for song in songs:
+        yt_views = fetch_youtube_views(song['歌曲名稱'], song['歌手'])
+        spotify_pop = fetch_spotify_popularity(song['歌曲名稱'], song['歌手'], token)
+        score = (yt_views / 1000) * 0.5 + spotify_pop * 0.5
+        chart.append({
+            "歌曲": song['歌曲名稱'],
+            "歌手": song['歌手'],
+            "YT播放量": yt_views,
+            "Spotify熱度": spotify_pop,
+            "總分": round(score, 2),
+            "Spotify連結": f"https://open.spotify.com/search/{urllib.parse.quote(song['歌曲名稱'] + ' ' + song['歌手'])}"
+        })
+    df = pd.DataFrame(chart)
+    df["排名"] = df["總分"].rank(ascending=False, method="min").astype(int)
+    return df.sort_values("排名")
+
+# === 產生 HTML 表格 ===
+def generate_html_table(df):
+    html = '''
+    <h2>🔥 本週歌曲排行榜</h2>
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%;text-align:center;">
+        <thead>
+            <tr>
+                <th>排名</th>
+                <th>歌曲</th>
+                <th>歌手</th>
+                <th>YouTube 播放量</th>
+                <th>Spotify 熱度</th>
+                <th>總分</th>
+                <th>Spotify</th>
+            </tr>
+        </thead>
+        <tbody>
+    '''
+    for _, row in df.iterrows():
+        html += f"""
+        <tr>
+            <td>{row['排名']}</td>
+            <td>{row['歌曲']}</td>
+            <td>{row['歌手']}</td>
+            <td>{row['YT播放量']:,}</td>
+            <td>{row['Spotify熱度']}</td>
+            <td>{row['總分']}</td>
+            <td><a class='spotify' href='{row['Spotify連結']}' target='_blank'>🎧</a></td>
+        </tr>
+        """
+    html += '</tbody></table>'
+    return html
+
+# === 產生 AI 解說段落（簡化） ===
+def generate_ai_summary(df):
+    top1 = df.iloc[0]
+    top3 = df.head(3)
+    song_list = ", ".join([f"《{row['歌曲']}》 by {row['歌手']}" for _, row in top3.iterrows()])
+    summary = (
+        f"This week's top 3 songs are: {song_list}. "
+        f"#1 is 《{top1['歌曲']}》 by {top1['歌手']} with a total score of {top1['總分']}. "
+        f"Momentum remains strong for Mandarin pop!"
+    )
+    return summary
+
+# === 自動發佈到 Blogger，支援 token.json 快取授權 ===
+def publish_to_blogger(html_content, title="MACP Music Chart"):
+    SCOPES = ['https://www.googleapis.com/auth/blogger']
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
+        creds = flow.run_local_server(port=8080)
+        with open(TOKEN_PATH, 'w') as token:
+            token.write(creds.to_json())
+
+    service = build('blogger', 'v3', credentials=creds)
+
+    # 取得使用者部落格 ID
+    blogs = service.blogs().listByUser(userId='self').execute()
+    blog_id = blogs['items'][0]['id']
+
+    # 發佈新文章
+    post = {
+        'title': title,
+        'content': html_content
+    }
+    response = service.posts().insert(blogId=blog_id, body=post, isDraft=False).execute()
+    print(f"✔ 已發佈文章：{response.get('title')}")
+    print(f"🔗 網址：{response.get('url')}")
+
+# === 主程式執行 ===
+if __name__ == "__main__":
+    os.makedirs("logs", exist_ok=True)
+    chart_df = build_chart()
+    summary = generate_ai_summary(chart_df)
+    html_output = f"<p>{summary}</p>\n" + generate_html_table(chart_df)
+
+    # 寫入本地檔案（可選）
+    with open("ranking_output.html", "w", encoding="utf-8") as f:
+        f.write(html_output)
+    print("✔ 排行榜已產出（含 AI 解說段落）")
+
+    # 自動發佈到 Blogger
+    publish_to_blogger(html_output, title="MACP 本週歌曲數據榜")
